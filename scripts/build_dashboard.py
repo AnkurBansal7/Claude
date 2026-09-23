@@ -458,6 +458,91 @@ def build_dashboard_sheet(wb, outlet_sheets, report_date):
                   "is enabled in Petpooja's Notification tab — see PaymentMap sheet.").font = SUBTITLE_FONT
 
 
+def write_csv_snapshot(path, report_date, outlets_data):
+    """Plain-text CSV mirror of the dashboard, one section per outlet.
+
+    This exists because MCP tool attachments (Gmail) and binary Drive uploads
+    (base64Content) require the agent to transcribe the file's raw bytes as a
+    literal string in a tool call — verbatim reproduction of an opaque,
+    high-entropy blob like that is not reliable at any practical size (this
+    was verified the hard way: even small ~8KB chunks silently lost/altered
+    characters on manual transcription). Plain text has none of that risk, so
+    for delivery (as opposed to the full xlsx, which a human can download
+    with SendUserFile and doesn't need retyping), always publish this CSV via
+    Google Drive's `textContent` field instead of base64-encoding the xlsx.
+    """
+    import csv as _csv
+
+    with open(path, "w", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["Petpooja Daily Discount Dashboard"])
+        w.writerow(["Report date", report_date])
+        w.writerow([])
+
+        for outlet in outlets_data:
+            name = outlet["name"]
+            order_agg = outlet["order_agg"]
+            payment_map = outlet["payment_map"]
+
+            totals = defaultdict(lambda: [0.0, 0.0, 0])
+            for invoice, a in order_agg.items():
+                entry = payment_map.get(invoice)
+                platform = entry["platform"] if entry else PENDING_LABEL
+                t = totals[platform]
+                t[0] += a["sub_total"]
+                t[1] += a["discount"]
+                t[2] += 1
+
+            def pct(invoice_data):
+                sub, disc = invoice_data["sub_total"], invoice_data["discount"]
+                return (disc / sub * 100) if sub else 0.0
+
+            staff = sorted(
+                (inv for inv, a in order_agg.items()
+                 if a["sub_total"] > 0 and pct(a) >= 99.9
+                 and payment_map.get(inv, {}).get("platform") == "Dine-in"),
+                key=int)
+            high_online = sorted(
+                (inv for inv, a in order_agg.items()
+                 if a["sub_total"] > 0 and pct(a) > 50
+                 and payment_map.get(inv, {}).get("platform") in ("Swiggy", "Zomato")),
+                key=int)
+            dine15 = [inv for inv, a in order_agg.items()
+                      if a["sub_total"] > 0 and pct(a) > 15
+                      and payment_map.get(inv, {}).get("platform") == "Dine-in"]
+            dine30 = [inv for inv, a in order_agg.items()
+                      if a["sub_total"] > 0 and pct(a) > 30
+                      and payment_map.get(inv, {}).get("platform") == "Dine-in"]
+            dine50 = [inv for inv, a in order_agg.items()
+                      if a["sub_total"] > 0 and pct(a) > 50
+                      and payment_map.get(inv, {}).get("platform") == "Dine-in"]
+
+            w.writerow(["Outlet", name])
+            w.writerow([])
+            w.writerow(["Platform", "Orders", "Avg Discount %"])
+            for platform in ("Dine-in", "Swiggy", "Zomato", PENDING_LABEL):
+                sub, disc, n = totals.get(platform, (0.0, 0.0, 0))
+                if n == 0 and platform == PENDING_LABEL:
+                    continue
+                avg = round(disc / sub * 100, 1) if sub else 0
+                w.writerow([platform, n, avg])
+            w.writerow([])
+            w.writerow(["Flag", "Count", "Invoices"])
+            w.writerow(["100% Discount Dine-in (Staff)", len(staff), " ".join(staff)])
+            w.writerow([">50% Discount Swiggy/Zomato", len(high_online), " ".join(high_online)])
+            w.writerow(["Dine-in >15% Discount", len(dine15), ""])
+            w.writerow(["Dine-in >30% Discount", len(dine30), ""])
+            w.writerow(["Dine-in >50% Discount", len(dine50), ""])
+            w.writerow([])
+            w.writerow(["Invoice No.", "Sub Total", "Discount", "Discount %", "Payment Mode", "Platform"])
+            for inv in sorted(order_agg.keys(), key=int):
+                a = order_agg[inv]
+                entry = payment_map.get(inv, {})
+                w.writerow([inv, round(a["sub_total"], 2), round(a["discount"], 2),
+                            round(pct(a), 1), entry.get("mode", ""), entry.get("platform", PENDING_LABEL)])
+            w.writerow([])
+
+
 def main(manifest_path, output_path):
     with open(manifest_path) as f:
         manifest = json.load(f)
@@ -468,6 +553,7 @@ def main(manifest_path, output_path):
 
     outlet_sheets = []
     all_payment_rows = []
+    outlets_data = []
 
     for outlet in manifest["outlets"]:
         name = outlet["name"]
@@ -483,12 +569,17 @@ def main(manifest_path, output_path):
 
         sheet_name, _ = build_outlet_sheet(wb, name, report_date, order_agg, payment_map)
         outlet_sheets.append(sheet_name)
+        outlets_data.append({"name": name, "order_agg": order_agg, "payment_map": payment_map})
 
     build_payment_map_sheet(wb, all_payment_rows)
     build_dashboard_sheet(wb, outlet_sheets, report_date)
 
     wb.save(output_path)
-    print(json.dumps({"output": output_path, "outlets": outlet_sheets}))
+
+    csv_path = re.sub(r"\.xlsx$", "", output_path) + ".csv"
+    write_csv_snapshot(csv_path, report_date, outlets_data)
+
+    print(json.dumps({"output": output_path, "csv": csv_path, "outlets": outlet_sheets}))
 
 
 if __name__ == "__main__":

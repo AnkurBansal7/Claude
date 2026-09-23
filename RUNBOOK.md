@@ -68,29 +68,58 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
    python3 scripts/build_dashboard.py manifest.json Petpooja_Discount_Dashboard.xlsx
    ```
 
-   This produces one sheet per outlet (raw per-order table + formula-driven
-   summary + conditional-formatting highlights) plus a `Dashboard` summary
-   sheet and a `PaymentMap` sheet holding the raw payment-mode rows. See
-   "What the dashboard shows" below.
+   This produces the formula-driven `.xlsx` (one sheet per outlet with the
+   raw per-order table, summary formulas, and conditional-formatting
+   highlights, plus a `Dashboard` summary sheet and a `PaymentMap` sheet) —
+   see "What the dashboard shows" below — **and** a plain-text
+   `Petpooja_Discount_Dashboard.csv` snapshot of the same numbers (same base
+   name, `.csv` extension). Always use both outputs; see step 5 for why.
 
-5. **Publish it:**
-   - **Google Sheet** — upload via the Drive connector
-     (`contentMimeType: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`,
-     do *not* set `disableConversionToGoogleType`) so it converts to a native
-     Sheet and recalculates. Update the existing daily sheet in place if one
-     already exists, don't create a new file every day.
-   - **Email** — attach the same `.xlsx` and send it to the outlet mailbox
-     (or whichever address the user prefers) with the report date in the
-     subject.
+5. **Publish it — READ THIS BEFORE ATTACHING ANYTHING:**
+
+   Do not pass the `.xlsx` file's bytes as a `base64Content` (Drive) or
+   attachment `content` (Gmail) tool parameter. Verified the hard way while
+   building this pipeline: an agent must reproduce that value as a literal
+   string in its own output, and verbatim reproduction of an opaque
+   high-entropy blob like base64 is **not reliable at any practical size** —
+   corruption was observed even in an isolated ~8KB chunk. A file that looks
+   fine when spot-checked can still be silently corrupted elsewhere (e.g. in
+   unused theme/style XML), so "it opened and looked right" is not proof the
+   bytes were transmitted correctly. This will bite every single daily run
+   unless you use the reliable channels below:
+
+   - **Google Sheet** — upload the **CSV**, not the xlsx: call
+     `mcp__Google_Drive__create_file` with `contentMimeType: "text/csv"` and
+     `textContent` set to the *literal* CSV text (plain UTF-8 — safe to
+     reproduce, unlike base64). Do not set `base64Content`. Drive
+     auto-converts it to a native Sheet. `create_file` cannot update an
+     existing file's content (only rename via `update_file`), so create a
+     new Sheet each day and `trash_file` the previous day's — keep the title
+     identical ("Petpooja Daily Discount Dashboard") so the user finds it the
+     same way each time.
+   - **Give the human the real workbook** — use the `SendUserFile` tool with
+     the local `.xlsx` path. It transfers the file directly through the
+     harness, not through the model's text output, so it has none of the
+     base64-transcription risk and preserves formulas/formatting/chart. This
+     is the right way to hand over the full xlsx — never Gmail.
+   - **Email** — send a plain-text summary (platform split, flagged invoice
+     numbers, the Google Sheet link) in the message body. Do not attach the
+     xlsx (or any binary file) via `mcp__Gmail__send_message` — its
+     `attachments[].content` field requires base64, which has the same
+     unreliability. If you must email something, attach the CSV's
+     already-verified `textContent` re-encoded to base64 only when small
+     (a few KB) — always verify by reading back whatever you upload to Drive
+     before trusting it, since Drive's `read_file_content` gives a cheap
+     correctness check that Gmail's attachment path doesn't.
 
 6. **Recalculation note.** This sandbox's LibreOffice install currently fails
    to load *any* file (`soffice --convert-to` errors with "source file could
    not be loaded" even for a plain `.txt`), so `scripts/recalc.py` from the
    xlsx skill cannot be used to pre-verify formulas here. This doesn't affect
-   the deliverable: Excel and Google Sheets both recalculate on open. If you
-   ever need to verify formula output before sending, cross-check the numbers
-   independently in Python (aggregate the item-wise rows by invoice and
-   compare) rather than relying on a local LO recalc in this environment.
+   the deliverable: Excel and Google Sheets both recalculate on open. The CSV
+   snapshot's numbers are computed directly in Python (not via the xlsx
+   formulas), so cross-check a few against the xlsx's formula cells if you
+   change the calculation logic.
 
 ## What the dashboard shows (per outlet)
 
