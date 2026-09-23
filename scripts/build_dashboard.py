@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
 """
 Build the Petpooja Daily Discount Dashboard workbook from Item Wise Report
-(with Bill No.) and Payment Wise Order Summary xlsx exports.
+(with Bill No.) and Payment Wise Summary report exports.
 
-Both reports follow Petpooja's standard notification-email template:
+Item Wise Report With Bill No. arrives as a real .xlsx (OOXML). Columns
+observed:
+    Date, Timestamp, Server Name, Table No., Invoice No., hsn_code,
+    Category, Item, Variation, Price, Qty., Sub Total, Discount, Tax,
+    Final Total
+  -> one row per line item; grouped by Invoice No. to get per-order totals.
+
+Payment Wise Summary arrives with an .xls extension but is actually an HTML
+table (Excel's classic "save as HTML, name it .xls" export) — NOT a real
+xlsx/xls binary. Columns observed:
+    Invoice No., Date, Payment Type, Order Type, Status, Persons, Area,
+    Assign To, Not Paid, Cash, Card, Due Payment, Other, Wallet, UPI, Online
+  -> one row per bill. Platform is derived from Order Type + Area:
+    - Order Type contains "dine"        -> Dine-in
+    - Area contains "zomato"            -> Zomato
+    - Area contains "swiggy"            -> Swiggy
+    - otherwise (cash/card, no area)    -> Dine-in
+
+Both report types share Petpooja's standard notification-email layout:
     Row 1: "Date:"             , "<start> to <end>"
     Row 2: "Name:"             , "<report name>"
     Row 3: "Restaurant Name:"  , "<outlet>"
@@ -11,16 +29,10 @@ Both reports follow Petpooja's standard notification-email template:
     Row 5: column headers
     Row 6+: data
 
-Item Wise Report With Bill No. columns (as observed):
-    Date, Timestamp, Server Name, Table No., Invoice No., hsn_code,
-    Category, Item, Variation, Price, Qty., Sub Total, Discount, Tax,
-    Final Total
-  -> one row per line item; grouped by Invoice No. to get per-order totals.
-
-Payment Wise Order Summary columns vary by account configuration, so the
-parser looks for a bill/invoice column and a payment-mode/order-type column
-by header keyword instead of a fixed position. Until that report is enabled,
-pass payment_wise_xlsx=None for an outlet and every order is marked
+File format (real xlsx vs HTML-as-.xls) is auto-detected from content, not
+from the file extension, since Petpooja doesn't use the extension
+consistently. Until the Payment Wise Summary report is enabled for an
+outlet, pass payment_wise_xlsx=None and every order is marked
 "Pending (awaiting Payment Wise report)" in the workbook, ready to resolve
 automatically once real data is supplied (see PaymentMap sheet).
 
@@ -33,7 +45,7 @@ Manifest schema:
   "outlets": [
     {"name": "Tuskin Coffee Andheri West",
      "item_wise_xlsx": "/path/Item_bill_report_....xlsx",
-     "payment_wise_xlsx": "/path/Payment_wise_....xlsx" | null}
+     "payment_wise_xlsx": "/path/payment_wise_summary_....xls" | null}
   ]
 }
 """
@@ -41,6 +53,7 @@ import sys
 import json
 import re
 from collections import defaultdict
+from html.parser import HTMLParser
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -67,22 +80,81 @@ FILL_TIER3 = PatternFill("solid", fgColor="FCA5A5")       # dine-in >50%
 PENDING_LABEL = "Pending (awaiting Payment Wise report)"
 
 
-def _find_header_row(ws, max_scan=10):
+class _HTMLTableParser(HTMLParser):
+    """Minimal stdlib parser for Petpooja's "Excel HTML" .xls exports
+    (flat <table>/<tr>/<td|th> markup, no nesting or colspans)."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self._row = None
+        self._cell = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self._row = []
+        elif tag in ("td", "th"):
+            self._cell = []
+
+    def handle_endtag(self, tag):
+        if tag == "tr" and self._row is not None:
+            self.rows.append(tuple(self._row))
+            self._row = None
+        elif tag in ("td", "th") and self._cell is not None:
+            text = "".join(self._cell).strip()
+            self._row.append(text if text else None)
+            self._cell = None
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+def _load_rows(path):
+    """Return report data as a list of row-tuples, regardless of whether the
+    file is a real xlsx (OOXML zip) or an HTML table saved with a
+    misleading .xls/.xlsx extension (Petpooja does both)."""
+    with open(path, "rb") as f:
+        head = f.read(4)
+    if head[:2] == b"PK":
+        wb = openpyxl.load_workbook(path, data_only=True)
+        return list(wb.active.iter_rows(values_only=True))
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        html = f.read()
+    parser = _HTMLTableParser()
+    parser.feed(html)
+    width = max((len(r) for r in parser.rows), default=0)
+    return [r + (None,) * (width - len(r)) for r in parser.rows]
+
+
+def _find_header_row(rows, max_scan=10):
     """Petpooja report exports start with 3 metadata rows, a blank row, then headers."""
-    for r in range(1, max_scan + 1):
-        row_vals = [c.value for c in ws[r]]
-        non_null = [v for v in row_vals if v not in (None, "")]
+    for i, row in enumerate(rows[:max_scan]):
+        non_null = [v for v in row if v not in (None, "")]
         if len(non_null) >= 4 and all(isinstance(v, str) for v in non_null):
-            return r
-    raise ValueError(f"Could not locate header row in sheet {ws.title!r}")
+            return i
+    raise ValueError("Could not locate header row")
+
+
+def _num(value):
+    if value in (None, ""):
+        return 0.0
+    return float(str(value).replace(",", ""))
+
+
+def _clean_invoice(value):
+    s = str(value).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
 
 
 def parse_item_wise(path):
     """Return list of {invoice, sub_total, discount, final_total} per line item."""
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb.active
-    header_row = _find_header_row(ws)
-    headers = [str(c.value).strip() if c.value else "" for c in ws[header_row]]
+    rows = _load_rows(path)
+    header_row = _find_header_row(rows)
+    headers = [str(h).strip() if h else "" for h in rows[header_row]]
     idx = {h.lower(): i for i, h in enumerate(headers)}
 
     def col(*keywords):
@@ -96,25 +168,40 @@ def parse_item_wise(path):
     c_discount = col("discount")
     c_final = col("final", "total")
 
-    rows = []
-    for r in ws.iter_rows(min_row=header_row + 1, values_only=True):
+    out = []
+    for r in rows[header_row + 1:]:
         if r[c_invoice] in (None, ""):
             continue
-        rows.append({
-            "invoice": str(r[c_invoice]),
-            "sub_total": float(r[c_subtotal] or 0),
-            "discount": float(r[c_discount] or 0),
-            "final_total": float(r[c_final] or 0),
+        invoice = _clean_invoice(r[c_invoice])
+        if not invoice.isdigit():
+            continue  # skip the report's trailing "Total" row
+        out.append({
+            "invoice": invoice,
+            "sub_total": _num(r[c_subtotal]),
+            "discount": _num(r[c_discount]),
+            "final_total": _num(r[c_final]),
         })
-    return rows
+    return out
+
+
+def classify_platform(order_type: str, area: str, payment_type: str) -> str:
+    o = (order_type or "").lower()
+    a = (area or "").lower()
+    p = (payment_type or "").lower()
+    if "dine" in o:
+        return "Dine-in"
+    if "zomato" in a or "zomato" in p:
+        return "Zomato"
+    if "swiggy" in a or "swiggy" in p:
+        return "Swiggy"
+    return "Dine-in"
 
 
 def parse_payment_wise(path):
-    """Return {invoice: payment_mode} using flexible header matching."""
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb.active
-    header_row = _find_header_row(ws)
-    headers = [str(c.value).strip() if c.value else "" for c in ws[header_row]]
+    """Return {invoice: {"mode": <display string>, "platform": <Dine-in/Swiggy/Zomato>}}."""
+    rows = _load_rows(path)
+    header_row = _find_header_row(rows)
+    headers = [str(h).strip() if h else "" for h in rows[header_row]]
     idx = {h.lower(): i for i, h in enumerate(headers)}
 
     def find(*keywords):
@@ -123,28 +210,35 @@ def parse_payment_wise(path):
                 return i
         return None
 
-    c_invoice = find("invoice") or find("bill")
-    c_mode = find("payment", "mode") or find("payment", "type") or find("order", "type")
-    if c_invoice is None or c_mode is None:
-        raise KeyError(
-            f"Could not find invoice/payment-mode columns in headers: {headers}"
-        )
+    c_invoice = find("invoice")
+    if c_invoice is None:
+        c_invoice = find("bill")
+    c_order_type = find("order", "type")
+    c_area = find("area")
+    c_payment_type = find("payment", "type")
+    if c_payment_type is None:
+        c_payment_type = find("payment", "mode")
+    if c_invoice is None:
+        raise KeyError(f"Could not find an invoice/bill column in headers: {headers}")
 
     mapping = {}
-    for r in ws.iter_rows(min_row=header_row + 1, values_only=True):
+    for r in rows[header_row + 1:]:
         if r[c_invoice] in (None, ""):
             continue
-        mapping[str(r[c_invoice])] = str(r[c_mode] or "").strip()
+        invoice = _clean_invoice(r[c_invoice])
+        if not invoice.isdigit():
+            continue  # skip the report's trailing "Total" row
+
+        order_type = str(r[c_order_type]).strip() if c_order_type is not None and r[c_order_type] else ""
+        area = str(r[c_area]).strip() if c_area is not None and r[c_area] else ""
+        payment_type = str(r[c_payment_type]).strip() if c_payment_type is not None and r[c_payment_type] else ""
+
+        platform = classify_platform(order_type, area, payment_type)
+        mode = payment_type or order_type or "Unknown"
+        if area:
+            mode = f"{mode} ({area})"
+        mapping[invoice] = {"mode": mode, "platform": platform}
     return mapping
-
-
-def classify_platform(payment_mode: str) -> str:
-    m = (payment_mode or "").lower()
-    if "zomato" in m:
-        return "Zomato"
-    if "swiggy" in m:
-        return "Swiggy"
-    return "Dine-in"
 
 
 def aggregate_orders(item_rows):
@@ -213,8 +307,9 @@ def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
     for i, invoice in enumerate(invoices):
         r = first_data_row + i
         a = order_agg[invoice]
-        mode = payment_map.get(invoice, "")
-        platform = classify_platform(mode) if invoice in payment_map else PENDING_LABEL
+        entry = payment_map.get(invoice)
+        mode = entry["mode"] if entry else ""
+        platform = entry["platform"] if entry else PENDING_LABEL
 
         ws.cell(row=r, column=1, value=invoice).font = BODY_FONT
         ws.cell(row=r, column=2, value=round(a["sub_total"], 2)).number_format = "#,##0.00"
@@ -284,21 +379,21 @@ def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
 
 def build_payment_map_sheet(wb, all_rows):
     ws = wb.create_sheet("PaymentMap")
-    ws["A1"] = "Raw Payment Wise Order Summary rows (used to resolve Platform on each outlet sheet)"
+    ws["A1"] = "Raw Payment Wise Summary rows (used to resolve Platform on each outlet sheet)"
     ws["A1"].font = SUBTITLE_FONT
     headers = ["Outlet", "Invoice No.", "Payment Mode", "Platform"]
     for c, h in enumerate(headers, start=1):
         ws.cell(row=3, column=c, value=h)
     style_header(ws, 3, len(headers))
-    for i, (outlet, invoice, mode) in enumerate(all_rows):
+    for i, (outlet, invoice, mode, platform) in enumerate(all_rows):
         r = 4 + i
         ws.cell(row=r, column=1, value=outlet)
         ws.cell(row=r, column=2, value=invoice)
         ws.cell(row=r, column=3, value=mode)
-        ws.cell(row=r, column=4, value=classify_platform(mode))
+        ws.cell(row=r, column=4, value=platform)
     autosize(ws, [28, 14, 22, 12])
     if not all_rows:
-        ws["A5"] = "No Payment Wise Order Summary data received yet for any outlet."
+        ws["A5"] = "No Payment Wise Summary data received yet for any outlet."
         ws["A5"].font = BODY_FONT
 
 
@@ -383,8 +478,8 @@ def main(manifest_path, output_path):
         pw_path = outlet.get("payment_wise_xlsx")
         if pw_path:
             payment_map = parse_payment_wise(pw_path)
-            for invoice, mode in payment_map.items():
-                all_payment_rows.append((name, invoice, mode))
+            for invoice, entry in payment_map.items():
+                all_payment_rows.append((name, invoice, entry["mode"], entry["platform"]))
 
         sheet_name, _ = build_outlet_sheet(wb, name, report_date, order_agg, payment_map)
         outlet_sheets.append(sheet_name)

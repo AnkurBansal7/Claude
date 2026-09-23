@@ -5,14 +5,17 @@ Every night at midnight, Petpooja emails two reports per outlet from
 
 1. **"Report Notification: Item Wise Report With Bill No. : <Outlet>"** — one
    row per line item, with `Invoice No.`, `Sub Total`, `Discount`, `Tax`,
-   `Final Total`. Always arrives as an `.xlsx` attachment.
-2. **"Report Notification: Payment Wise Order Summary"** (or similarly named,
-   exact subject may vary) — one row per bill with a payment-mode / order-type
-   column. This is what lets us tell Dine-in apart from Swiggy and Zomato.
-   *As of 2026-09-23 this report was not yet enabled in the Petpooja
-   Notification tab for the one outlet on this account (Tuskin Coffee Andheri
-   West); the dashboard runs without it and marks every order
-   "Pending (awaiting Payment Wise report)" until it's turned on.*
+   `Final Total`. Arrives as a real `.xlsx` (OOXML) attachment.
+2. **"Report Notification: Payment Wise Summary : <Outlet>"** — one row per
+   bill, with `Invoice No.`, `Payment Type` (Online/Cash/Card), `Order Type`
+   (`Dine In` or `Delivery(Parcel)`), and `Area` (`Zomato`/`Swiggy`/blank).
+   This is what lets us tell Dine-in apart from Swiggy and Zomato. **Gotcha:**
+   despite the `.xls` filename, this attachment is actually an HTML table
+   (Excel's old "save as HTML, name it .xls" export), not a real binary/OOXML
+   file — `scripts/build_dashboard.py` auto-detects this from content (checks
+   for the `PK` zip magic bytes) and parses either format. It also has a
+   trailing `Total` footer row that must be filtered out (both parsers skip
+   any row whose invoice value isn't purely numeric).
 
 This repo holds the scripts that turn those two attachments into the daily
 **Petpooja Daily Discount Dashboard** workbook. There is no cron job that
@@ -22,8 +25,12 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
 ## Daily steps (run at 9am, for the previous day's midnight emails)
 
 1. **Find the emails.** Search Gmail (`from:support@petpooja.com newer_than:1d`)
-   for each outlet's Item Wise Report and Payment Wise Order Summary for
-   yesterday's date. There may be more than one outlet — process each.
+   for each outlet's Item Wise Report and Payment Wise Summary for yesterday's
+   date. There may be more than one outlet — process each. Subject lines seen
+   so far: "Report Notification: Item Wise Report With Bill No. : <Outlet>"
+   and "Report Notification: Payment Wise Summary : <Outlet>" — search
+   broadly (e.g. `subject:"Report Notification"`) since exact wording could
+   vary by account/report configuration.
 
 2. **Extract attachments.** Gmail's `get_message`/`get_thread` tools only
    expose attachment *metadata* (id/filename/mime type), not the bytes. Fetch
@@ -45,14 +52,15 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
      "outlets": [
        {"name": "Tuskin Coffee Andheri West",
         "item_wise_xlsx": "/path/Item_bill_report_....xlsx",
-        "payment_wise_xlsx": "/path/Payment_wise_....xlsx"}
+        "payment_wise_xlsx": "/path/payment_wise_summary_....xls"}
      ]
    }
    ```
 
    Set `"payment_wise_xlsx": null` for an outlet whose payment-wise report
-   hasn't arrived yet — the dashboard still builds, just without the platform
-   split for that outlet.
+   hasn't arrived that day — the dashboard still builds, just without the
+   platform split for that outlet (orders show as
+   "Pending (awaiting Payment Wise report)").
 
 4. **Build the dashboard:**
 
@@ -93,10 +101,10 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
   50% discount, highlighted yellow/amber/red on the order table.
 
 Platform is resolved by matching each Item Wise Report's `Invoice No.`
-against the Payment Wise Order Summary's bill/invoice + payment-mode columns
-(`Zomato` in the mode → Zomato, `Swiggy` → Swiggy, everything else → Dine-in).
-Until that second report is enabled, orders show as
-"Pending (awaiting Payment Wise report)".
+against the Payment Wise Summary's `Order Type` + `Area` columns:
+`Order Type` containing "dine" → Dine-in; otherwise `Area` = Zomato/Swiggy
+gives the platform directly. Until that second report arrives for a given
+day/outlet, orders show as "Pending (awaiting Payment Wise report)".
 
 ## Scheduling
 
