@@ -34,14 +34,39 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
 
 2. **Extract attachments.** Gmail's `get_message`/`get_thread` tools only
    expose attachment *metadata* (id/filename/mime type), not the bytes. Fetch
-   the message with `messageFormat: RAW` (this returns a large base64 MIME
-   blob and gets saved to a tool-result file automatically) and run:
+   the message with `messageFormat: RAW`. For most messages this is large
+   enough that the harness auto-saves it to a tool-result file, and you run:
 
    ```bash
    python3 scripts/extract_gmail_attachment.py <raw_message.json> <out_dir>
    ```
 
    This decodes the RFC822 message and writes each attachment to `<out_dir>`.
+
+   **Gotcha: borderline-sized messages return inline instead of saving to a
+   file.** If a RAW response comes back inline in your own context rather
+   than as a "result saved to file" pointer, do **not** try to save that
+   inline JSON to a file yourself by retyping/copying it into a Write call —
+   this was tried (confirmed with three independent attempts on one message)
+   and it silently truncated or corrupted the base64 `raw` field every time,
+   at a consistent length, producing a `.xlsx` that fails to open
+   (`zipfile.BadZipFile`). This is the same binary-transcription problem as
+   step 5, just triggered earlier in the pipeline. Instead, run:
+
+   ```bash
+   python3 scripts/extract_from_transcript.py <your_own_transcript.jsonl> <out_dir>
+   ```
+
+   This finds the `get_message` tool_result inside the calling agent's own
+   `.jsonl` transcript (the harness wrote the exact bytes there — the file
+   path is `~/.claude/projects/<project>/subagents/agent-<id>.jsonl` for a
+   subagent transcript, or check the session's own log location if this is
+   the main session) and extracts the attachment mechanically from that, with
+   zero model-generated text in the path. If you delegated the fetch to a
+   subagent specifically because of this issue, its `.jsonl` transcript path
+   is under `~/.claude/projects/.../subagents/agent-<agentId>.jsonl` — the
+   `agentId` is given when you spawn it. Confirmed working (2026-09-24, Tuskin
+   Coffee Bandra's item-wise report).
 
 3. **Build a manifest** (`manifest.json`) listing every outlet found and the
    paths to its two attachments for that date:
