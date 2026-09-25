@@ -72,12 +72,14 @@ THIN = Side(style="thin", color="D1D5DB")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 FILL_STAFF = PatternFill("solid", fgColor="FCA5A5")      # 100% discount dine-in
-FILL_HIGH_ONLINE = PatternFill("solid", fgColor="FDBA74")  # >50% Swiggy/Zomato
+FILL_HIGH_ONLINE = PatternFill("solid", fgColor="FDBA74")  # >52% Swiggy/Zomato
 FILL_TIER1 = PatternFill("solid", fgColor="FEF3C7")       # dine-in >15%
 FILL_TIER2 = PatternFill("solid", fgColor="FDE68A")       # dine-in >30%
 FILL_TIER3 = PatternFill("solid", fgColor="FCA5A5")       # dine-in >50%
 
 PENDING_LABEL = "Pending (awaiting Payment Wise report)"
+
+ONLINE_HIGH_DISCOUNT_PCT = 52  # Swiggy/Zomato "high discount" highlight threshold
 
 
 class _HTMLTableParser(HTMLParser):
@@ -287,7 +289,7 @@ def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
     labels = [
         "Orders — Dine-in", "Orders — Swiggy", "Orders — Zomato", "Orders — Pending platform",
         "Avg Discount % — Dine-in", "Avg Discount % — Swiggy", "Avg Discount % — Zomato",
-        "Orders >50% Discount — Swiggy", "Orders >50% Discount — Zomato",
+        "Orders >52% Discount — Swiggy", "Orders >52% Discount — Zomato",
         "100% Discount Dine-in Orders (Staff)",
         "Dine-in Orders >15% Discount", "Dine-in Orders >30% Discount", "Dine-in Orders >50% Discount",
     ]
@@ -296,7 +298,7 @@ def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
 
     TABLE_HEADER_ROW = 20
     headers = ["Invoice No.", "Sub Total", "Discount", "Discount %", "Payment Mode",
-               "Platform", "Flag: 100% Dine-in (Staff)", "Flag: >50% Online Discount",
+               "Platform", "Flag: 100% Dine-in (Staff)", f"Flag: >{ONLINE_HIGH_DISCOUNT_PCT}% Online Discount",
                "Flag: Dine-in Discount Tier"]
     for c, h in enumerate(headers, start=1):
         ws.cell(row=TABLE_HEADER_ROW, column=c, value=h)
@@ -322,7 +324,8 @@ def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
         ws.cell(row=r, column=7,
                 value=f'=IF(AND(F{r}="Dine-in",D{r}>=0.999),"STAFF ORDER","")')
         ws.cell(row=r, column=8,
-                value=f'=IF(AND(OR(F{r}="Swiggy",F{r}="Zomato"),D{r}>0.5),"HIGH DISCOUNT","")')
+                value=(f'=IF(AND(OR(F{r}="Swiggy",F{r}="Zomato"),'
+                       f'D{r}>{ONLINE_HIGH_DISCOUNT_PCT / 100}),"HIGH DISCOUNT","")'))
         ws.cell(row=r, column=9,
                 value=(f'=IF(F{r}<>"Dine-in","",'
                        f'IF(D{r}>0.5,">50%",IF(D{r}>0.3,">30%",IF(D{r}>0.15,">15%",""))))'))
@@ -340,8 +343,8 @@ def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
         ws["B9"] = f'=IFERROR(AVERAGEIF({rng("F")},"Dine-in",{rng("D")}),0)'
         ws["B10"] = f'=IFERROR(AVERAGEIF({rng("F")},"Swiggy",{rng("D")}),0)'
         ws["B11"] = f'=IFERROR(AVERAGEIF({rng("F")},"Zomato",{rng("D")}),0)'
-        ws["B12"] = f'=COUNTIFS({rng("F")},"Swiggy",{rng("D")},">0.5")'
-        ws["B13"] = f'=COUNTIFS({rng("F")},"Zomato",{rng("D")},">0.5")'
+        ws["B12"] = f'=COUNTIFS({rng("F")},"Swiggy",{rng("D")},">{ONLINE_HIGH_DISCOUNT_PCT / 100}")'
+        ws["B13"] = f'=COUNTIFS({rng("F")},"Zomato",{rng("D")},">{ONLINE_HIGH_DISCOUNT_PCT / 100}")'
         ws["B14"] = f'=COUNTIFS({rng("F")},"Dine-in",{rng("D")},">=0.999")'
         ws["B15"] = f'=COUNTIFS({rng("F")},"Dine-in",{rng("D")},">0.15")'
         ws["B16"] = f'=COUNTIFS({rng("F")},"Dine-in",{rng("D")},">0.3")'
@@ -405,7 +408,8 @@ def build_dashboard_sheet(wb, outlet_sheets, report_date):
     ws["A2"].font = SUBTITLE_FONT
 
     headers = ["Outlet", "Avg Disc % Dine-in", "Avg Disc % Swiggy", "Avg Disc % Zomato",
-               ">50% Disc Swiggy", ">50% Disc Zomato", "100% Disc Dine-in (Staff)",
+               f">{ONLINE_HIGH_DISCOUNT_PCT}% Disc Swiggy", f">{ONLINE_HIGH_DISCOUNT_PCT}% Disc Zomato",
+               "100% Disc Dine-in (Staff)",
                "Dine-in >15%", "Dine-in >30%", "Dine-in >50%", "Orders Pending Platform"]
     header_row = 4
     for c, h in enumerate(headers, start=1):
@@ -450,9 +454,9 @@ def build_dashboard_sheet(wb, outlet_sheets, report_date):
 
     notes_row = last_row + 22
     ws.cell(row=notes_row, column=1,
-            value="Legend: red = 100% discount dine-in (staff order) / dine-in >50% tier · "
-                  "orange = >50% discount on Swiggy or Zomato · "
-                  "amber/yellow = dine-in >15% / >30% discount tiers.").font = SUBTITLE_FONT
+            value=f"Legend: red = 100% discount dine-in (staff order) / dine-in >50% tier · "
+                  f"orange = >{ONLINE_HIGH_DISCOUNT_PCT}% discount on Swiggy or Zomato · "
+                  f"amber/yellow = dine-in >15% / >30% discount tiers.").font = SUBTITLE_FONT
     ws.cell(row=notes_row + 1, column=1,
             value='Orders show as "Pending (awaiting Payment Wise report)" until that report '
                   "is enabled in Petpooja's Notification tab — see PaymentMap sheet.").font = SUBTITLE_FONT
@@ -504,7 +508,7 @@ def write_csv_snapshot(path, report_date, outlets_data):
                 key=int)
             high_online = sorted(
                 (inv for inv, a in order_agg.items()
-                 if a["sub_total"] > 0 and pct(a) > 50
+                 if a["sub_total"] > 0 and pct(a) > ONLINE_HIGH_DISCOUNT_PCT
                  and payment_map.get(inv, {}).get("platform") in ("Swiggy", "Zomato")),
                 key=int)
             dine15 = [inv for inv, a in order_agg.items()
@@ -529,7 +533,7 @@ def write_csv_snapshot(path, report_date, outlets_data):
             w.writerow([])
             w.writerow(["Flag", "Count", "Invoices"])
             w.writerow(["100% Discount Dine-in (Staff)", len(staff), " ".join(staff)])
-            w.writerow([">50% Discount Swiggy/Zomato", len(high_online), " ".join(high_online)])
+            w.writerow([f">{ONLINE_HIGH_DISCOUNT_PCT}% Discount Swiggy/Zomato", len(high_online), " ".join(high_online)])
             w.writerow(["Dine-in >15% Discount", len(dine15), ""])
             w.writerow(["Dine-in >30% Discount", len(dine30), ""])
             w.writerow(["Dine-in >50% Discount", len(dine50), ""])

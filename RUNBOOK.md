@@ -149,7 +149,9 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
 ## What the dashboard shows (per outlet)
 
 - **Avg discount %** by platform (Dine-in / Swiggy / Zomato).
-- **Orders >50% discount** on Swiggy or Zomato — highlighted orange.
+- **Orders >52% discount** on Swiggy or Zomato — highlighted orange. (Raised
+  from >50% on 2026-09-25 per user request; see `ONLINE_HIGH_DISCOUNT_PCT` in
+  `scripts/build_dashboard.py`.)
 - **100% discount Dine-in orders** — flagged as staff orders, highlighted red.
 - **Dine-in discount tiers** — counts of dine-in orders above 15%, 30%, and
   50% discount, highlighted yellow/amber/red on the order table.
