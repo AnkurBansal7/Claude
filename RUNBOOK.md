@@ -17,7 +17,23 @@ Every night at midnight, Petpooja emails two reports per outlet from
    trailing `Total` footer row that must be filtered out (both parsers skip
    any row whose invoice value isn't purely numeric).
 
-This repo holds the scripts that turn those two attachments into the daily
+Separately, every morning `reports@phonepe.com` emails **one** report
+covering all outlets together:
+
+3. **"TUSKINFOOD Settlement Report"** — a `.zip` attachment (not
+   password-protected) containing one `.csv`: `Merchant_Settlement_Report_
+   TUSKINFOOD_<date>_<batch>.csv`. One row per digital transaction (UPI scan
+   AND card swipes through the PhonePe terminal — i.e. everything that isn't
+   cash), with `StoreName`, `Amount`, `PaymentType` (`PAYMENT`/`REFUND`),
+   `TransactionDate`, `SettlementDate`. `TransactionDate` matches the report
+   date (settlement itself is T+1, so this email — like Petpooja's — arrives
+   the next morning). `StoreName` uses different formatting per outlet than
+   Petpooja does ("Andheri TUSKIN COFFEE", "TUSKIN COFFEE BANDRA ", "TUSKIN
+   COFFEE POWAI", "TUSKIN COFFEE FORT ") — `build_dashboard.py` matches it to
+   an outlet by keyword (`_outlet_keyword`/`match_phonepe_total`), not exact
+   string equality.
+
+This repo holds the scripts that turn those attachments into the daily
 **Petpooja Daily Discount Dashboard** workbook. There is no cron job that
 runs headlessly — a Claude session wakes up on a schedule (see "Scheduling"
 below) and executes these steps directly using its Gmail/Drive/Sheets tools.
@@ -30,7 +46,10 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
    so far: "Report Notification: Item Wise Report With Bill No. : <Outlet>"
    and "Report Notification: Payment Wise Summary : <Outlet>" — search
    broadly (e.g. `subject:"Report Notification"`) since exact wording could
-   vary by account/report configuration.
+   vary by account/report configuration. Also search
+   `from:reports@phonepe.com newer_than:1d` (subject "TUSKINFOOD Settlement
+   Report") for the one shared PhonePe settlement email — it isn't
+   per-outlet, so there's just one to find.
 
 2. **Extract attachments.** Gmail's `get_message`/`get_thread` tools only
    expose attachment *metadata* (id/filename/mime type), not the bytes. Fetch
@@ -68,12 +87,20 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
    `agentId` is given when you spawn it. Confirmed working (2026-09-24, Tuskin
    Coffee Bandra's item-wise report).
 
-3. **Build a manifest** (`manifest.json`) listing every outlet found and the
-   paths to its two attachments for that date:
+   The PhonePe email's attachment is a `.zip`, but the same
+   `extract_gmail_attachment.py` / `extract_from_transcript.py` scripts save
+   it to disk as-is — `build_dashboard.py`'s `parse_phonepe_settlement()`
+   unzips it in memory (via Python's `zipfile`, no shelling out), so there's
+   no separate unzip step to run by hand.
+
+3. **Build a manifest** (`manifest.json`) listing every outlet found, the
+   paths to its two Petpooja attachments, and the shared PhonePe settlement
+   file for that date:
 
    ```json
    {
      "report_date": "2026-09-22",
+     "phonepe_settlement": "/path/Merchant_Settlement_Report_....zip",
      "outlets": [
        {"name": "Tuskin Coffee Andheri West",
         "item_wise_xlsx": "/path/Item_bill_report_....xlsx",
@@ -85,7 +112,9 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
    Set `"payment_wise_xlsx": null` for an outlet whose payment-wise report
    hasn't arrived that day — the dashboard still builds, just without the
    platform split for that outlet (orders show as
-   "Pending (awaiting Payment Wise report)").
+   "Pending (awaiting Payment Wise report)"). Set `"phonepe_settlement": null`
+   (or omit it) on a day that email hasn't arrived — every outlet's
+   Balance — Cash then shows a pending placeholder instead of a number.
 
 4. **Build the dashboard:**
 
@@ -155,6 +184,15 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
 - **100% discount Dine-in orders** — flagged as staff orders, highlighted red.
 - **Dine-in discount tiers** — counts of dine-in orders above 15%, 30%, and
   50% discount, highlighted yellow/amber/red on the order table.
+- **Cash reconciliation vs PhonePe** (added 2026-09-25) — Dine-in Total Sales
+  minus that day's PhonePe settlement total (UPI + card, all non-cash
+  payment) leaves the balance that should be cash, highlighted green. If the
+  balance comes out **negative** (PhonePe collected more than the dine-in
+  total), it's highlighted red instead — that's a real mismatch to
+  investigate (e.g. a miscounted order, a duplicate scan, a platform-payment
+  transaction leaking into the PhonePe totals for that outlet), not a normal
+  cash figure — never force it positive. Shown per outlet and on the
+  cross-outlet `Dashboard` sheet.
 
 Platform is resolved by matching each Item Wise Report's `Invoice No.`
 against the Payment Wise Summary's `Order Type` + `Area` columns:

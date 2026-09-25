@@ -36,12 +36,26 @@ outlet, pass payment_wise_xlsx=None and every order is marked
 "Pending (awaiting Payment Wise report)" in the workbook, ready to resolve
 automatically once real data is supplied (see PaymentMap sheet).
 
+PhonePe "Merchant Settlement Report" (from reports@phonepe.com, subject
+"TUSKINFOOD Settlement Report") is a single .zip (one .csv inside, not
+password-protected) shared across ALL outlets, rows differentiated by a
+`StoreName` column ("Andheri TUSKIN COFFEE", "TUSKIN COFFEE BANDRA ", etc.
+-- matched to an outlet by keyword, see `_outlet_keyword`/`match_phonepe_total`).
+`TransactionDate` matches the report_date (settlement itself lags a day,
+arriving alongside the next day's Petpooja emails). It covers every
+non-cash payment instrument taken at the counter (UPI scan-and-pay AND
+card swipes via the PhonePe EDC machine). Each outlet sheet's Dine-in
+Total Sales minus this PhonePe total is highlighted as the implied cash
+balance. Pass "phonepe_settlement": null (or omit it) on a day the report
+hasn't arrived yet -- the balance shows as pending instead.
+
 Usage:
     python3 build_dashboard.py <manifest.json> <output.xlsx>
 
 Manifest schema:
 {
   "report_date": "2026-09-22",
+  "phonepe_settlement": "/path/Merchant_Settlement_Report_....zip" | null,
   "outlets": [
     {"name": "Tuskin Coffee Andheri West",
      "item_wise_xlsx": "/path/Item_bill_report_....xlsx",
@@ -52,6 +66,9 @@ Manifest schema:
 import sys
 import json
 import re
+import csv
+import io
+import zipfile
 from collections import defaultdict
 from html.parser import HTMLParser
 
@@ -76,8 +93,11 @@ FILL_HIGH_ONLINE = PatternFill("solid", fgColor="FDBA74")  # >52% Swiggy/Zomato
 FILL_TIER1 = PatternFill("solid", fgColor="FEF3C7")       # dine-in >15%
 FILL_TIER2 = PatternFill("solid", fgColor="FDE68A")       # dine-in >30%
 FILL_TIER3 = PatternFill("solid", fgColor="FCA5A5")       # dine-in >50%
+FILL_CASH_RECON = PatternFill("solid", fgColor="A7F3D0")  # dine-in cash balance vs PhonePe
+FILL_CASH_MISMATCH = PatternFill("solid", fgColor="FCA5A5")  # balance < 0: PhonePe exceeds dine-in total
 
 PENDING_LABEL = "Pending (awaiting Payment Wise report)"
+PENDING_PHONEPE_LABEL = "Pending (no PhonePe settlement report)"
 
 ONLINE_HIGH_DISCOUNT_PCT = 52  # Swiggy/Zomato "high discount" highlight threshold
 
@@ -254,6 +274,60 @@ def aggregate_orders(item_rows):
     return agg
 
 
+def parse_phonepe_settlement(path):
+    """Parse a PhonePe "Merchant Settlement Report" export into per-row
+    digital-payment amounts.
+
+    One report is emailed daily (from reports@phonepe.com, subject
+    "TUSKINFOOD Settlement Report") covering ALL outlets in a single .zip
+    attachment containing one .csv, rows differentiated by a `StoreName`
+    column. `TransactionDate` matches the report_date (the report itself
+    arrives the next morning, T+1 settlement, alongside Petpooja's emails).
+    Rows cover every non-cash payment instrument taken at the counter/table
+    (UPI scan-and-pay AND card swipes via the PhonePe EDC machine) -- i.e.
+    everything that isn't cash.
+    """
+    if str(path).lower().endswith(".zip"):
+        with zipfile.ZipFile(path) as zf:
+            csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
+            with zf.open(csv_name) as f:
+                text = f.read().decode("utf-8-sig")
+    else:
+        with open(path, encoding="utf-8-sig") as f:
+            text = f.read()
+
+    rows = []
+    for r in csv.DictReader(io.StringIO(text)):
+        store = (r.get("StoreName") or "").strip()
+        if not store:
+            continue
+        amount = _num(r.get("Amount"))
+        ptype = (r.get("PaymentType") or "").strip().upper()
+        if ptype == "PAYMENT":
+            signed = amount
+        elif "REFUND" in ptype:
+            signed = -amount
+        else:
+            continue
+        rows.append({"store_name": store, "amount": signed})
+    return rows
+
+
+def _outlet_keyword(outlet_name: str) -> str:
+    """Reduce e.g. "Tuskin Coffee Andheri West" to "andheri" for matching
+    against PhonePe's differently-formatted StoreName strings (e.g. "Andheri
+    TUSKIN COFFEE", "TUSKIN COFFEE BANDRA ")."""
+    name = re.sub(r"(?i)tuskin\s*coffee", "", outlet_name).strip()
+    return (name.split()[0] if name else outlet_name).lower()
+
+
+def match_phonepe_total(outlet_name, phonepe_rows):
+    """Sum PhonePe settlement amounts for the rows matching this outlet."""
+    keyword = _outlet_keyword(outlet_name)
+    matched = [r for r in phonepe_rows if keyword in r["store_name"].lower()]
+    return sum(r["amount"] for r in matched), len(matched)
+
+
 def sanitize_sheet_name(name: str) -> str:
     name = re.sub(r"[:\\/?*\[\]]", "-", name)
     return name[:31]
@@ -273,7 +347,7 @@ def autosize(ws, widths):
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
-def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
+def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map, phonepe_total=None):
     sheet_name = sanitize_sheet_name(outlet_name)
     ws = wb.create_sheet(sheet_name)
 
@@ -292,14 +366,15 @@ def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
         "Orders >52% Discount — Swiggy", "Orders >52% Discount — Zomato",
         "100% Discount Dine-in Orders (Staff)",
         "Dine-in Orders >15% Discount", "Dine-in Orders >30% Discount", "Dine-in Orders >50% Discount",
+        "Dine-in Total Sales (Rs.)", "PhonePe UPI+Card Total (Rs.)", "Balance — Cash (Rs.)",
     ]
     for i, lbl in enumerate(labels):
         ws.cell(row=5 + i, column=1, value=lbl).font = LABEL_FONT
 
-    TABLE_HEADER_ROW = 20
+    TABLE_HEADER_ROW = 5 + len(labels) + 2
     headers = ["Invoice No.", "Sub Total", "Discount", "Discount %", "Payment Mode",
                "Platform", "Flag: 100% Dine-in (Staff)", f"Flag: >{ONLINE_HIGH_DISCOUNT_PCT}% Online Discount",
-               "Flag: Dine-in Discount Tier"]
+               "Flag: Dine-in Discount Tier", "Final Total"]
     for c, h in enumerate(headers, start=1):
         ws.cell(row=TABLE_HEADER_ROW, column=c, value=h)
     style_header(ws, TABLE_HEADER_ROW, len(headers))
@@ -329,6 +404,7 @@ def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
         ws.cell(row=r, column=9,
                 value=(f'=IF(F{r}<>"Dine-in","",'
                        f'IF(D{r}>0.5,">50%",IF(D{r}>0.3,">30%",IF(D{r}>0.15,">15%",""))))'))
+        ws.cell(row=r, column=10, value=round(a["final_total"], 2)).number_format = "#,##0.00"
         for c in range(1, len(headers) + 1):
             ws.cell(row=r, column=c).border = BORDER
 
@@ -349,16 +425,41 @@ def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
         ws["B15"] = f'=COUNTIFS({rng("F")},"Dine-in",{rng("D")},">0.15")'
         ws["B16"] = f'=COUNTIFS({rng("F")},"Dine-in",{rng("D")},">0.3")'
         ws["B17"] = f'=COUNTIFS({rng("F")},"Dine-in",{rng("D")},">0.5")'
+        ws["B18"] = f'=SUMIFS({rng("J")},{rng("F")},"Dine-in")'
     else:
-        for r in range(5, 18):
+        for r in range(5, 19):
             ws.cell(row=r, column=2, value=0)
 
     for r in (9, 10, 11):
         ws.cell(row=r, column=2).number_format = "0.0%"
+    ws["B18"].number_format = "#,##0.00"
+
+    # ---- PhonePe reconciliation: Dine-in total minus PhonePe (UPI+card)
+    # settlement leaves the balance that should be cash. Flag it. ----
+    if phonepe_total is None:
+        ws["B19"] = PENDING_PHONEPE_LABEL
+        ws["B20"] = ""
+    else:
+        ws["B19"] = round(phonepe_total, 2)
+        ws["B19"].number_format = "#,##0.00"
+        ws["B20"] = "=B18-B19"
+        ws["B20"].number_format = "#,##0.00"
+        for r in (18, 19):
+            for c in (1, 2):
+                ws.cell(row=r, column=c).fill = FILL_CASH_RECON
+        # Balance should never be negative (PhonePe can't collect more than
+        # was billed dine-in) -- red flags that as a real mismatch to
+        # investigate rather than a normal cash figure.
+        ws.conditional_formatting.add(
+            "A20:B20",
+            FormulaRule(formula=["AND(ISNUMBER($B20),$B20<0)"], fill=FILL_CASH_MISMATCH))
+        ws.conditional_formatting.add(
+            "A20:B20",
+            FormulaRule(formula=["AND(ISNUMBER($B20),$B20>=0)"], fill=FILL_CASH_RECON))
 
     # Conditional formatting highlights on the order table
     if invoices:
-        data_range = f"A{first_data_row}:I{last_data_row}"
+        data_range = f"A{first_data_row}:J{last_data_row}"
         ws.conditional_formatting.add(
             data_range,
             FormulaRule(formula=[f'$G{first_data_row}="STAFF ORDER"'], fill=FILL_STAFF))
@@ -376,7 +477,7 @@ def build_outlet_sheet(wb, outlet_name, report_date, order_agg, payment_map):
             FormulaRule(formula=[f'$I{first_data_row}=">15%"'], fill=FILL_TIER1))
 
     ws.freeze_panes = f"A{first_data_row}"
-    autosize(ws, [14, 12, 12, 12, 24, 12, 22, 22, 20])
+    autosize(ws, [14, 12, 12, 12, 24, 12, 22, 22, 20, 14])
     return sheet_name, (first_data_row, last_data_row if invoices else None)
 
 
@@ -410,7 +511,8 @@ def build_dashboard_sheet(wb, outlet_sheets, report_date):
     headers = ["Outlet", "Avg Disc % Dine-in", "Avg Disc % Swiggy", "Avg Disc % Zomato",
                f">{ONLINE_HIGH_DISCOUNT_PCT}% Disc Swiggy", f">{ONLINE_HIGH_DISCOUNT_PCT}% Disc Zomato",
                "100% Disc Dine-in (Staff)",
-               "Dine-in >15%", "Dine-in >30%", "Dine-in >50%", "Orders Pending Platform"]
+               "Dine-in >15%", "Dine-in >30%", "Dine-in >50%", "Orders Pending Platform",
+               "Dine-in Total Sales", "PhonePe UPI+Card Total", "Balance — Cash"]
     header_row = 4
     for c, h in enumerate(headers, start=1):
         ws.cell(row=header_row, column=c, value=h)
@@ -430,13 +532,26 @@ def build_dashboard_sheet(wb, outlet_sheets, report_date):
         ws.cell(row=r, column=9, value=f"={q}!B16")
         ws.cell(row=r, column=10, value=f"={q}!B17")
         ws.cell(row=r, column=11, value=f"={q}!B8")
+        ws.cell(row=r, column=12, value=f"={q}!B18")
+        ws.cell(row=r, column=13, value=f"=IF(ISNUMBER({q}!B19),{q}!B19,\"{PENDING_PHONEPE_LABEL}\")")
+        ws.cell(row=r, column=14, value=f"=IF(ISNUMBER({q}!B19),{q}!B20,\"\")")
         for c in (2, 3, 4):
             ws.cell(row=r, column=c).number_format = "0.0%"
+        for c in (12, 13, 14):
+            ws.cell(row=r, column=c).number_format = "#,##0.00"
         for c in range(1, len(headers) + 1):
             ws.cell(row=r, column=c).border = BORDER
 
     last_row = header_row + len(outlet_sheets)
-    autosize(ws, [28, 16, 16, 16, 14, 14, 18, 12, 12, 12, 18])
+    if outlet_sheets:
+        balance_range = f"N{header_row + 1}:N{last_row}"
+        ws.conditional_formatting.add(
+            balance_range,
+            FormulaRule(formula=["AND(ISNUMBER($N5),$N5<0)"], fill=FILL_CASH_MISMATCH))
+        ws.conditional_formatting.add(
+            balance_range,
+            FormulaRule(formula=["AND(ISNUMBER($N5),$N5>=0)"], fill=FILL_CASH_RECON))
+    autosize(ws, [28, 16, 16, 16, 14, 14, 18, 12, 12, 12, 18, 18, 20, 16])
 
     if outlet_sheets:
         chart = BarChart()
@@ -454,12 +569,16 @@ def build_dashboard_sheet(wb, outlet_sheets, report_date):
 
     notes_row = last_row + 22
     ws.cell(row=notes_row, column=1,
-            value=f"Legend: red = 100% discount dine-in (staff order) / dine-in >50% tier · "
+            value=f"Legend: red = 100% discount dine-in (staff order) / dine-in >50% tier / "
+                  f"Balance — Cash is negative (PhonePe exceeds dine-in total — investigate) · "
                   f"orange = >{ONLINE_HIGH_DISCOUNT_PCT}% discount on Swiggy or Zomato · "
-                  f"amber/yellow = dine-in >15% / >30% discount tiers.").font = SUBTITLE_FONT
+                  f"amber/yellow = dine-in >15% / >30% discount tiers · "
+                  f"green = implied cash balance (Dine-in total minus PhonePe UPI+card).").font = SUBTITLE_FONT
     ws.cell(row=notes_row + 1, column=1,
             value='Orders show as "Pending (awaiting Payment Wise report)" until that report '
-                  "is enabled in Petpooja's Notification tab — see PaymentMap sheet.").font = SUBTITLE_FONT
+                  "is enabled in Petpooja's Notification tab — see PaymentMap sheet. Balance — Cash "
+                  "shows \"" + PENDING_PHONEPE_LABEL + "\" until that day's PhonePe settlement email "
+                  "arrives.").font = SUBTITLE_FONT
 
 
 def write_csv_snapshot(path, report_date, outlets_data):
@@ -487,6 +606,7 @@ def write_csv_snapshot(path, report_date, outlets_data):
             name = outlet["name"]
             order_agg = outlet["order_agg"]
             payment_map = outlet["payment_map"]
+            phonepe_total = outlet.get("phonepe_total")
 
             totals = defaultdict(lambda: [0.0, 0.0, 0])
             for invoice, a in order_agg.items():
@@ -538,12 +658,26 @@ def write_csv_snapshot(path, report_date, outlets_data):
             w.writerow(["Dine-in >30% Discount", len(dine30), ""])
             w.writerow(["Dine-in >50% Discount", len(dine50), ""])
             w.writerow([])
-            w.writerow(["Invoice No.", "Sub Total", "Discount", "Discount %", "Payment Mode", "Platform"])
+
+            dine_total = sum(a["final_total"] for inv, a in order_agg.items()
+                              if payment_map.get(inv, {}).get("platform") == "Dine-in")
+            w.writerow(["Payment Reconciliation (Dine-in)"])
+            w.writerow(["Dine-in Total Sales", round(dine_total, 2)])
+            if phonepe_total is None:
+                w.writerow(["PhonePe UPI+Card Total", PENDING_PHONEPE_LABEL])
+                w.writerow(["Balance — Cash", ""])
+            else:
+                w.writerow(["PhonePe UPI+Card Total", round(phonepe_total, 2)])
+                w.writerow(["Balance — Cash", round(dine_total - phonepe_total, 2)])
+            w.writerow([])
+
+            w.writerow(["Invoice No.", "Sub Total", "Discount", "Discount %", "Payment Mode", "Platform", "Final Total"])
             for inv in sorted(order_agg.keys(), key=int):
                 a = order_agg[inv]
                 entry = payment_map.get(inv, {})
                 w.writerow([inv, round(a["sub_total"], 2), round(a["discount"], 2),
-                            round(pct(a), 1), entry.get("mode", ""), entry.get("platform", PENDING_LABEL)])
+                            round(pct(a), 1), entry.get("mode", ""), entry.get("platform", PENDING_LABEL),
+                            round(a["final_total"], 2)])
             w.writerow([])
 
 
@@ -559,6 +693,11 @@ def main(manifest_path, output_path):
     all_payment_rows = []
     outlets_data = []
 
+    phonepe_rows = []
+    phonepe_path = manifest.get("phonepe_settlement")
+    if phonepe_path:
+        phonepe_rows = parse_phonepe_settlement(phonepe_path)
+
     for outlet in manifest["outlets"]:
         name = outlet["name"]
         item_rows = parse_item_wise(outlet["item_wise_xlsx"])
@@ -571,9 +710,14 @@ def main(manifest_path, output_path):
             for invoice, entry in payment_map.items():
                 all_payment_rows.append((name, invoice, entry["mode"], entry["platform"]))
 
-        sheet_name, _ = build_outlet_sheet(wb, name, report_date, order_agg, payment_map)
+        phonepe_total = None
+        if phonepe_rows:
+            phonepe_total, _ = match_phonepe_total(name, phonepe_rows)
+
+        sheet_name, _ = build_outlet_sheet(wb, name, report_date, order_agg, payment_map, phonepe_total)
         outlet_sheets.append(sheet_name)
-        outlets_data.append({"name": name, "order_agg": order_agg, "payment_map": payment_map})
+        outlets_data.append({"name": name, "order_agg": order_agg, "payment_map": payment_map,
+                              "phonepe_total": phonepe_total})
 
     build_payment_map_sheet(wb, all_payment_rows)
     build_dashboard_sheet(wb, outlet_sheets, report_date)
