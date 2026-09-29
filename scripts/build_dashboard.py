@@ -62,8 +62,16 @@ Manifest schema:
      "payment_wise_xlsx": "/path/payment_wise_summary_....xls" | null}
   ]
 }
+
+Trends across days: every run appends/updates one row per outlet in
+data/discount_history.csv (repo-relative, tracked in git so it survives
+across sessions) and rebuilds the workbook's "Trends" sheet from that whole
+history -- one table + line charts per outlet, so the daily discount %,
+flagged-order counts, and cash-reconciliation balance can be read as a
+series over time rather than a single day's snapshot.
 """
 import sys
+import os
 import json
 import re
 import csv
@@ -76,7 +84,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.utils import get_column_letter
-from openpyxl.chart import BarChart, Reference
+from openpyxl.chart import BarChart, LineChart, Reference
 
 FONT_NAME = "Arial"
 HEADER_FILL = PatternFill("solid", fgColor="1F2937")
@@ -100,6 +108,18 @@ PENDING_LABEL = "Pending (awaiting Payment Wise report)"
 PENDING_PHONEPE_LABEL = "Pending (no PhonePe settlement report)"
 
 ONLINE_HIGH_DISCOUNT_PCT = 52  # Swiggy/Zomato "high discount" highlight threshold
+
+HISTORY_PATH_DEFAULT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "data", "discount_history.csv")
+HISTORY_FIELDS = [
+    "date", "outlet",
+    "dine_in_orders", "dine_in_avg_pct",
+    "swiggy_orders", "swiggy_avg_pct",
+    "zomato_orders", "zomato_avg_pct",
+    "staff_orders", "high_discount_online",
+    "dine15_count", "dine30_count", "dine50_count",
+    "dine_in_total", "phonepe_total", "cash_balance",
+]
 
 
 class _HTMLTableParser(HTMLParser):
@@ -326,6 +346,203 @@ def match_phonepe_total(outlet_name, phonepe_rows):
     keyword = _outlet_keyword(outlet_name)
     matched = [r for r in phonepe_rows if keyword in r["store_name"].lower()]
     return sum(r["amount"] for r in matched), len(matched)
+
+
+def compute_outlet_stats(order_agg, payment_map, phonepe_total=None):
+    """Python-side (non-formula) rollup of one outlet/day's numbers, shared by
+    the CSV snapshot and the cross-day history record."""
+    totals = defaultdict(lambda: [0.0, 0.0, 0])
+    for invoice, a in order_agg.items():
+        entry = payment_map.get(invoice)
+        platform = entry["platform"] if entry else PENDING_LABEL
+        t = totals[platform]
+        t[0] += a["sub_total"]
+        t[1] += a["discount"]
+        t[2] += 1
+
+    def pct(invoice_data):
+        sub, disc = invoice_data["sub_total"], invoice_data["discount"]
+        return (disc / sub * 100) if sub else 0.0
+
+    def platform_stats(name):
+        sub, disc, n = totals.get(name, (0.0, 0.0, 0))
+        avg = round(disc / sub * 100, 1) if sub else 0.0
+        return n, avg
+
+    dine_in_orders, dine_in_avg_pct = platform_stats("Dine-in")
+    swiggy_orders, swiggy_avg_pct = platform_stats("Swiggy")
+    zomato_orders, zomato_avg_pct = platform_stats("Zomato")
+
+    staff = [inv for inv, a in order_agg.items()
+             if a["sub_total"] > 0 and pct(a) >= 99.9
+             and payment_map.get(inv, {}).get("platform") == "Dine-in"]
+    high_online = [inv for inv, a in order_agg.items()
+                   if a["sub_total"] > 0 and pct(a) > ONLINE_HIGH_DISCOUNT_PCT
+                   and payment_map.get(inv, {}).get("platform") in ("Swiggy", "Zomato")]
+    dine15 = [inv for inv, a in order_agg.items()
+              if a["sub_total"] > 0 and pct(a) > 15
+              and payment_map.get(inv, {}).get("platform") == "Dine-in"]
+    dine30 = [inv for inv, a in order_agg.items()
+              if a["sub_total"] > 0 and pct(a) > 30
+              and payment_map.get(inv, {}).get("platform") == "Dine-in"]
+    dine50 = [inv for inv, a in order_agg.items()
+              if a["sub_total"] > 0 and pct(a) > 50
+              and payment_map.get(inv, {}).get("platform") == "Dine-in"]
+
+    dine_in_total = sum(a["final_total"] for inv, a in order_agg.items()
+                         if payment_map.get(inv, {}).get("platform") == "Dine-in")
+    cash_balance = None if phonepe_total is None else round(dine_in_total - phonepe_total, 2)
+
+    return {
+        "dine_in_orders": dine_in_orders, "dine_in_avg_pct": dine_in_avg_pct,
+        "swiggy_orders": swiggy_orders, "swiggy_avg_pct": swiggy_avg_pct,
+        "zomato_orders": zomato_orders, "zomato_avg_pct": zomato_avg_pct,
+        "staff_orders": len(staff), "staff_invoices": sorted(staff, key=int),
+        "high_discount_online": len(high_online), "high_discount_invoices": sorted(high_online, key=int),
+        "dine15_count": len(dine15), "dine30_count": len(dine30), "dine50_count": len(dine50),
+        "dine_in_total": round(dine_in_total, 2),
+        "phonepe_total": None if phonepe_total is None else round(phonepe_total, 2),
+        "cash_balance": cash_balance,
+    }
+
+
+def load_history(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def record_history(history_rows, report_date, outlet_name, stats):
+    """Insert/replace this (date, outlet)'s row -- reruns of the same
+    report_date overwrite rather than duplicate."""
+    row = {
+        "date": report_date, "outlet": outlet_name,
+        "dine_in_orders": stats["dine_in_orders"], "dine_in_avg_pct": stats["dine_in_avg_pct"],
+        "swiggy_orders": stats["swiggy_orders"], "swiggy_avg_pct": stats["swiggy_avg_pct"],
+        "zomato_orders": stats["zomato_orders"], "zomato_avg_pct": stats["zomato_avg_pct"],
+        "staff_orders": stats["staff_orders"], "high_discount_online": stats["high_discount_online"],
+        "dine15_count": stats["dine15_count"], "dine30_count": stats["dine30_count"],
+        "dine50_count": stats["dine50_count"],
+        "dine_in_total": stats["dine_in_total"],
+        "phonepe_total": "" if stats["phonepe_total"] is None else stats["phonepe_total"],
+        "cash_balance": "" if stats["cash_balance"] is None else stats["cash_balance"],
+    }
+    history_rows[:] = [r for r in history_rows
+                        if not (r["date"] == report_date and r["outlet"] == outlet_name)]
+    history_rows.append(row)
+
+
+def save_history(path, history_rows):
+    history_rows.sort(key=lambda r: (r["date"], r["outlet"]))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
+        w.writeheader()
+        w.writerows(history_rows)
+
+
+def build_trends_sheet(wb, history_rows, outlet_names):
+    """One "Trends" sheet, one block per outlet: the full daily history table
+    plus line charts (discount % by platform, cash balance, flagged-order
+    counts) so patterns across days -- not just a single day's snapshot --
+    are visible at a glance."""
+    ws = wb.create_sheet("Trends", 1)
+    ws["A1"] = "Trends Across Days"
+    ws["A1"].font = TITLE_FONT
+    ws["A2"] = "One row per report date · updated automatically on every run"
+    ws["A2"].font = SUBTITLE_FONT
+
+    table_headers = ["Date", "Dine-in Orders", "Dine-in Avg %", "Swiggy Orders", "Swiggy Avg %",
+                      "Zomato Orders", "Zomato Avg %", "Staff Orders",
+                      f">{ONLINE_HIGH_DISCOUNT_PCT}% Online", "Dine-in >15%", "Dine-in >30%",
+                      "Dine-in >50%", "Dine-in Total", "PhonePe Total", "Cash Balance"]
+    pct_cols = (3, 5, 7)
+    money_cols = (13, 14, 15)
+
+    block_row = 4
+    for outlet in outlet_names:
+        rows = sorted((r for r in history_rows if r["outlet"] == outlet), key=lambda r: r["date"])
+
+        ws.cell(row=block_row, column=1, value=f"Outlet: {outlet}").font = Font(
+            name=FONT_NAME, bold=True, size=12)
+        header_row = block_row + 2
+        for c, h in enumerate(table_headers, start=1):
+            ws.cell(row=header_row, column=c, value=h)
+        style_header(ws, header_row, len(table_headers))
+
+        first_data_row = header_row + 1
+        for i, r in enumerate(rows):
+            rr = first_data_row + i
+            values = [r["date"], int(r["dine_in_orders"]), float(r["dine_in_avg_pct"]) / 100,
+                      int(r["swiggy_orders"]), float(r["swiggy_avg_pct"]) / 100,
+                      int(r["zomato_orders"]), float(r["zomato_avg_pct"]) / 100,
+                      int(r["staff_orders"]), int(r["high_discount_online"]),
+                      int(r["dine15_count"]), int(r["dine30_count"]), int(r["dine50_count"]),
+                      float(r["dine_in_total"]),
+                      float(r["phonepe_total"]) if r["phonepe_total"] != "" else None,
+                      float(r["cash_balance"]) if r["cash_balance"] != "" else None]
+            for c, v in enumerate(values, start=1):
+                cell = ws.cell(row=rr, column=c, value=v)
+                if c in pct_cols:
+                    cell.number_format = "0.0%"
+                elif c in money_cols:
+                    cell.number_format = "#,##0.00"
+                cell.border = BORDER
+
+        last_data_row = first_data_row + len(rows) - 1 if rows else first_data_row
+        if rows:
+            balance_col_range = f"O{first_data_row}:O{last_data_row}"
+            ref = f"$O{first_data_row}"
+            ws.conditional_formatting.add(
+                balance_col_range,
+                FormulaRule(formula=[f"AND(ISNUMBER({ref}),{ref}<0)"], fill=FILL_CASH_MISMATCH))
+            ws.conditional_formatting.add(
+                balance_col_range,
+                FormulaRule(formula=[f"AND(ISNUMBER({ref}),{ref}>=0)"], fill=FILL_CASH_RECON))
+
+        chart_col = "R"
+        chart_block_end = header_row
+        if len(rows) >= 2:
+            cats = Reference(ws, min_col=1, min_row=first_data_row, max_row=last_data_row)
+
+            disc_chart = LineChart()
+            disc_chart.title = f"{outlet} — Avg Discount % by Platform"
+            disc_chart.y_axis.numFmt = "0%"
+            disc_chart.height = 8
+            disc_chart.width = 18
+            data = Reference(ws, min_col=3, max_col=3, min_row=header_row, max_row=last_data_row)
+            disc_chart.add_data(data, titles_from_data=True)
+            data = Reference(ws, min_col=5, max_col=5, min_row=header_row, max_row=last_data_row)
+            disc_chart.add_data(data, titles_from_data=True)
+            data = Reference(ws, min_col=7, max_col=7, min_row=header_row, max_row=last_data_row)
+            disc_chart.add_data(data, titles_from_data=True)
+            disc_chart.set_categories(cats)
+            ws.add_chart(disc_chart, f"{chart_col}{header_row}")
+
+            cash_chart = LineChart()
+            cash_chart.title = f"{outlet} — Cash Balance vs PhonePe (negative = mismatch)"
+            cash_chart.height = 8
+            cash_chart.width = 18
+            data = Reference(ws, min_col=15, max_col=15, min_row=header_row, max_row=last_data_row)
+            cash_chart.add_data(data, titles_from_data=True)
+            cash_chart.set_categories(cats)
+            ws.add_chart(cash_chart, f"{chart_col}{header_row + 17}")
+
+            flag_chart = LineChart()
+            flag_chart.title = f"{outlet} — Flagged Order Counts"
+            flag_chart.height = 8
+            flag_chart.width = 18
+            data = Reference(ws, min_col=8, max_col=9, min_row=header_row, max_row=last_data_row)
+            flag_chart.add_data(data, titles_from_data=True)
+            flag_chart.set_categories(cats)
+            ws.add_chart(flag_chart, f"{chart_col}{header_row + 34}")
+            chart_block_end = header_row + 34 + 17
+
+        block_row = max(last_data_row, chart_block_end) + 3
+
+    autosize(ws, [12, 14, 12, 14, 12, 14, 12, 12, 14, 12, 12, 12, 14, 14, 14])
+    return ws
 
 
 def sanitize_sheet_name(name: str) -> str:
@@ -607,6 +824,7 @@ def write_csv_snapshot(path, report_date, outlets_data):
             order_agg = outlet["order_agg"]
             payment_map = outlet["payment_map"]
             phonepe_total = outlet.get("phonepe_total")
+            stats = outlet.get("stats") or compute_outlet_stats(order_agg, payment_map, phonepe_total)
 
             totals = defaultdict(lambda: [0.0, 0.0, 0])
             for invoice, a in order_agg.items():
@@ -621,26 +839,6 @@ def write_csv_snapshot(path, report_date, outlets_data):
                 sub, disc = invoice_data["sub_total"], invoice_data["discount"]
                 return (disc / sub * 100) if sub else 0.0
 
-            staff = sorted(
-                (inv for inv, a in order_agg.items()
-                 if a["sub_total"] > 0 and pct(a) >= 99.9
-                 and payment_map.get(inv, {}).get("platform") == "Dine-in"),
-                key=int)
-            high_online = sorted(
-                (inv for inv, a in order_agg.items()
-                 if a["sub_total"] > 0 and pct(a) > ONLINE_HIGH_DISCOUNT_PCT
-                 and payment_map.get(inv, {}).get("platform") in ("Swiggy", "Zomato")),
-                key=int)
-            dine15 = [inv for inv, a in order_agg.items()
-                      if a["sub_total"] > 0 and pct(a) > 15
-                      and payment_map.get(inv, {}).get("platform") == "Dine-in"]
-            dine30 = [inv for inv, a in order_agg.items()
-                      if a["sub_total"] > 0 and pct(a) > 30
-                      and payment_map.get(inv, {}).get("platform") == "Dine-in"]
-            dine50 = [inv for inv, a in order_agg.items()
-                      if a["sub_total"] > 0 and pct(a) > 50
-                      and payment_map.get(inv, {}).get("platform") == "Dine-in"]
-
             w.writerow(["Outlet", name])
             w.writerow([])
             w.writerow(["Platform", "Orders", "Avg Discount %"])
@@ -652,23 +850,22 @@ def write_csv_snapshot(path, report_date, outlets_data):
                 w.writerow([platform, n, avg])
             w.writerow([])
             w.writerow(["Flag", "Count", "Invoices"])
-            w.writerow(["100% Discount Dine-in (Staff)", len(staff), " ".join(staff)])
-            w.writerow([f">{ONLINE_HIGH_DISCOUNT_PCT}% Discount Swiggy/Zomato", len(high_online), " ".join(high_online)])
-            w.writerow(["Dine-in >15% Discount", len(dine15), ""])
-            w.writerow(["Dine-in >30% Discount", len(dine30), ""])
-            w.writerow(["Dine-in >50% Discount", len(dine50), ""])
+            w.writerow(["100% Discount Dine-in (Staff)", stats["staff_orders"], " ".join(stats["staff_invoices"])])
+            w.writerow([f">{ONLINE_HIGH_DISCOUNT_PCT}% Discount Swiggy/Zomato", stats["high_discount_online"],
+                        " ".join(stats["high_discount_invoices"])])
+            w.writerow(["Dine-in >15% Discount", stats["dine15_count"], ""])
+            w.writerow(["Dine-in >30% Discount", stats["dine30_count"], ""])
+            w.writerow(["Dine-in >50% Discount", stats["dine50_count"], ""])
             w.writerow([])
 
-            dine_total = sum(a["final_total"] for inv, a in order_agg.items()
-                              if payment_map.get(inv, {}).get("platform") == "Dine-in")
             w.writerow(["Payment Reconciliation (Dine-in)"])
-            w.writerow(["Dine-in Total Sales", round(dine_total, 2)])
-            if phonepe_total is None:
+            w.writerow(["Dine-in Total Sales", stats["dine_in_total"]])
+            if stats["phonepe_total"] is None:
                 w.writerow(["PhonePe UPI+Card Total", PENDING_PHONEPE_LABEL])
                 w.writerow(["Balance — Cash", ""])
             else:
-                w.writerow(["PhonePe UPI+Card Total", round(phonepe_total, 2)])
-                w.writerow(["Balance — Cash", round(dine_total - phonepe_total, 2)])
+                w.writerow(["PhonePe UPI+Card Total", stats["phonepe_total"]])
+                w.writerow(["Balance — Cash", stats["cash_balance"]])
             w.writerow([])
 
             w.writerow(["Invoice No.", "Sub Total", "Discount", "Discount %", "Payment Mode", "Platform", "Final Total"])
@@ -681,7 +878,7 @@ def write_csv_snapshot(path, report_date, outlets_data):
             w.writerow([])
 
 
-def main(manifest_path, output_path):
+def main(manifest_path, output_path, history_path=HISTORY_PATH_DEFAULT):
     with open(manifest_path) as f:
         manifest = json.load(f)
 
@@ -690,6 +887,7 @@ def main(manifest_path, output_path):
     wb.remove(wb.active)
 
     outlet_sheets = []
+    outlet_names = []
     all_payment_rows = []
     outlets_data = []
 
@@ -697,6 +895,8 @@ def main(manifest_path, output_path):
     phonepe_path = manifest.get("phonepe_settlement")
     if phonepe_path:
         phonepe_rows = parse_phonepe_settlement(phonepe_path)
+
+    history_rows = load_history(history_path)
 
     for outlet in manifest["outlets"]:
         name = outlet["name"]
@@ -716,22 +916,30 @@ def main(manifest_path, output_path):
 
         sheet_name, _ = build_outlet_sheet(wb, name, report_date, order_agg, payment_map, phonepe_total)
         outlet_sheets.append(sheet_name)
+        outlet_names.append(name)
+
+        stats = compute_outlet_stats(order_agg, payment_map, phonepe_total)
         outlets_data.append({"name": name, "order_agg": order_agg, "payment_map": payment_map,
-                              "phonepe_total": phonepe_total})
+                              "phonepe_total": phonepe_total, "stats": stats})
+        record_history(history_rows, report_date, name, stats)
+
+    save_history(history_path, history_rows)
 
     build_payment_map_sheet(wb, all_payment_rows)
     build_dashboard_sheet(wb, outlet_sheets, report_date)
+    build_trends_sheet(wb, history_rows, outlet_names)
 
     wb.save(output_path)
 
     csv_path = re.sub(r"\.xlsx$", "", output_path) + ".csv"
     write_csv_snapshot(csv_path, report_date, outlets_data)
 
-    print(json.dumps({"output": output_path, "csv": csv_path, "outlets": outlet_sheets}))
+    print(json.dumps({"output": output_path, "csv": csv_path, "outlets": outlet_sheets,
+                       "history": history_path}))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: build_dashboard.py <manifest.json> <output.xlsx>", file=sys.stderr)
+    if len(sys.argv) not in (3, 4):
+        print("Usage: build_dashboard.py <manifest.json> <output.xlsx> [history.csv]", file=sys.stderr)
         sys.exit(1)
-    main(sys.argv[1], sys.argv[2])
+    main(*sys.argv[1:])

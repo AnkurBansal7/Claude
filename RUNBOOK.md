@@ -124,10 +124,28 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
 
    This produces the formula-driven `.xlsx` (one sheet per outlet with the
    raw per-order table, summary formulas, and conditional-formatting
-   highlights, plus a `Dashboard` summary sheet and a `PaymentMap` sheet) —
-   see "What the dashboard shows" below — **and** a plain-text
-   `Petpooja_Discount_Dashboard.csv` snapshot of the same numbers (same base
-   name, `.csv` extension). Always use both outputs; see step 5 for why.
+   highlights, plus a `Dashboard` summary sheet, a `Trends` sheet, and a
+   `PaymentMap` sheet) — see "What the dashboard shows" below — **and** a
+   plain-text `Petpooja_Discount_Dashboard.csv` snapshot of the same numbers
+   (same base name, `.csv` extension). Always use both outputs; see step 5
+   for why.
+
+   Every run also appends/updates that day's per-outlet numbers in
+   `data/discount_history.csv` (repo-relative, git-tracked — this is what
+   makes the `Trends` sheet possible; a rerun for a date already in the
+   history *overwrites* that date's row instead of duplicating it). After
+   the run, commit and push that file so the history survives a container
+   restart or a new session picking up the daily trigger:
+
+   ```bash
+   git add data/discount_history.csv
+   git commit -m "Record discount history for <report_date>"
+   git push -u origin claude/daily-discount-analysis-055cce
+   ```
+
+   If you ever need to point at a different history file (e.g. testing),
+   pass it as an optional third CLI argument:
+   `build_dashboard.py manifest.json output.xlsx path/to/history.csv`.
 
 5. **Publish it — READ THIS BEFORE ATTACHING ANYTHING:**
 
@@ -193,6 +211,19 @@ below) and executes these steps directly using its Gmail/Drive/Sheets tools.
   transaction leaking into the PhonePe totals for that outlet), not a normal
   cash figure — never force it positive. Shown per outlet and on the
   cross-outlet `Dashboard` sheet.
+
+## Trends across days (added 2026-09-29)
+
+The `Trends` sheet (right after `Dashboard`) turns the history in
+`data/discount_history.csv` into one block per outlet: a table with one row
+per report date, plus three line charts —
+avg discount % by platform, cash balance vs PhonePe (negative = mismatch,
+same red/green logic as the per-day sheets), and flagged-order counts
+(staff orders / >52% online discount). It rebuilds from the *entire* history
+file every run, so a day added out of order or a backfill just shows up in
+the right place next time the dashboard is built. Nothing needs to be
+hand-maintained — building the dashboard (step 4) both records the day into
+history and rebuilds this sheet from it automatically.
 
 Platform is resolved by matching each Item Wise Report's `Invoice No.`
 against the Payment Wise Summary's `Order Type` + `Area` columns:
